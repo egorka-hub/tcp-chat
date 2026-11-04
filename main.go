@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,6 +20,12 @@ type ChatMessage struct {
 	MessageType string
 }
 
+type Client struct {
+	ID       string
+	Conn     net.Conn
+	JoinTime time.Time
+}
+
 func StartEchoServer(port string) error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
@@ -27,21 +34,26 @@ func StartEchoServer(port string) error {
 	defer listener.Close()
 	fmt.Println("TCP Echo Server listening on", port)
 
-	fmt.Println("Waiting for connection...")
-	conn, err := listener.Accept()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+	for {
+		fmt.Println("Waiting for connection...")
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Println("accept error:", err)
+			continue
+		}
 
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		msg := ParseIncomingMessage(scanner.Text(), "User_001")
-		formatted := FormatMessage(msg)
-		conn.Write([]byte(formatted + "\n"))
-	}
+		client := &Client{
+			ID:       GenerateClientID(),
+			Conn:     conn,
+			JoinTime: time.Now(),
+		}
+		fmt.Println(client.ID, "connected")
 
-	return nil
+		if err := HandleClient(client); err != nil {
+			fmt.Println(client.ID, "error:", err)
+		}
+		fmt.Println(client.ID, "disconnected")
+	}
 }
 
 func FormatMessage(msg ChatMessage) string {
@@ -66,6 +78,29 @@ func ParseIncomingMessage(raw string, senderID string) ChatMessage {
 		Content:     raw,
 		MessageType: MessageTypeUser,
 	}
+}
+
+func HandleClient(client *Client) error {
+	defer client.Conn.Close()
+
+	scanner := bufio.NewScanner(client.Conn)
+
+	for scanner.Scan() {
+		msg := ParseIncomingMessage(scanner.Text(), client.ID)
+		formatted := FormatMessage(msg)
+		if _, err := client.Conn.Write([]byte(formatted + "\n")); err != nil {
+			return err
+		}
+	}
+
+	return scanner.Err()
+}
+
+var clientCounter atomic.Int64
+
+func GenerateClientID() string {
+	n := clientCounter.Add(1)
+	return fmt.Sprintf("User_%03d", n)
 }
 
 func main() {
