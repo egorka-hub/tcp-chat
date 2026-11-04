@@ -32,10 +32,9 @@ func StartEchoServer(port string) error {
 		return err
 	}
 	defer listener.Close()
-	fmt.Println("TCP Echo Server listening on", port)
+	fmt.Println("TCP Chat Server listening on", port)
 
 	for {
-		fmt.Println("Waiting for connection...")
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("accept error:", err)
@@ -47,12 +46,12 @@ func StartEchoServer(port string) error {
 			Conn:     conn,
 			JoinTime: time.Now(),
 		}
-		fmt.Println(client.ID, "connected")
+		fmt.Printf("Client %s connected\n", client.ID)
 
 		if err := HandleClient(client); err != nil {
-			fmt.Println(client.ID, "error:", err)
+			fmt.Printf("Client %s error: %v\n", client.ID, err)
 		}
-		fmt.Println(client.ID, "disconnected")
+		fmt.Printf("Client %s disconnected\n", client.ID)
 	}
 }
 
@@ -87,6 +86,7 @@ func HandleClient(client *Client) error {
 
 	for scanner.Scan() {
 		msg := ParseIncomingMessage(scanner.Text(), client.ID)
+		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
 		formatted := FormatMessage(msg)
 		if _, err := client.Conn.Write([]byte(formatted + "\n")); err != nil {
 			return err
