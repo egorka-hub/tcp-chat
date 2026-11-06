@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	MessageTypeUser   = "user"
-	MessageTypeSystem = "system"
+	MessageTypeUser     = "user"
+	MessageTypeSystem   = "system"
+	BroadcastBufferSize = 100
 )
 
 type ChatMessage struct {
@@ -26,7 +27,14 @@ type Client struct {
 	JoinTime time.Time
 }
 
-func StartEchoServer(port string) error {
+type Hub struct {
+	clients    map[string]*Client
+	broadcast  chan ChatMessage
+	register   chan *Client
+	unregister chan *Client
+}
+
+func StartEchoServer(port string, hub *Hub) error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		return err
@@ -48,7 +56,7 @@ func StartEchoServer(port string) error {
 		}
 
 		fmt.Printf("Client %s connected, starting goroutine\n", client.ID)
-		go handleClient(client.Conn, client.ID)
+		go handleClient(hub, client)
 	}
 }
 
@@ -76,19 +84,22 @@ func ParseIncomingMessage(raw string, senderID string) ChatMessage {
 	}
 }
 
-func handleClient(conn net.Conn, clientID string) {
-	defer conn.Close()
+func handleClient(hub *Hub, client *Client) {
+	defer func() {
+		hub.unregister <- client
+		client.Conn.Close()
+	}()
 
-	scanner := bufio.NewScanner(conn)
+	hub.register <- client
+	defer fmt.Printf("Client %s disconnected\n", client.ID)
+
+	scanner := bufio.NewScanner(client.Conn)
 
 	for scanner.Scan() {
-		msg := ParseIncomingMessage(scanner.Text(), clientID)
-		fmt.Printf("Client %s: %s\n", clientID, msg.Content)
-		formatted := FormatMessage(msg)
-		conn.Write([]byte(formatted + "\n"))
+		msg := ParseIncomingMessage(scanner.Text(), client.ID)
+		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
+		hub.broadcast <- msg
 	}
-
-	fmt.Printf("Client %s disconnected\n", clientID)
 }
 
 var clientCounter atomic.Int64
@@ -98,10 +109,54 @@ func GenerateClientID() string {
 	return fmt.Sprintf("User_%03d", n)
 }
 
+func (h *Hub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client.ID] = client
+			fmt.Printf("Client %s registered\n", client.ID)
+		case client := <-h.unregister:
+			delete(h.clients, client.ID)
+			fmt.Printf("Client %s unregistered\n", client.ID)
+
+		case msg := <-h.broadcast:
+			h.BroadcastMessage(msg)
+		}
+	}
+}
+
+func (h *Hub) BroadcastMessage(msg ChatMessage) {
+	text := FormatMessage(msg) + "\n"
+
+	for _, client := range h.clients {
+		if client.ID == msg.ClientID {
+			continue
+		}
+		_, err := client.Conn.Write([]byte(text))
+		if err != nil {
+			fmt.Printf("Write error to %s: %v\n", client.ID, err)
+			continue
+		}
+	}
+
+}
+
+func NewHub() *Hub {
+	return &Hub{
+		clients:    make(map[string]*Client),
+		broadcast:  make(chan ChatMessage, BroadcastBufferSize),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+	}
+}
+
 func main() {
 	const port = ":8080"
 
-	err := StartEchoServer(port)
+	hub := NewHub()
+	go hub.Run()
+
+	err := StartEchoServer(port, hub)
 	if err != nil {
 		fmt.Println("server error:", err)
 		return
