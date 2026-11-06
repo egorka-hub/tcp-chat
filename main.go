@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 )
@@ -12,6 +14,7 @@ const (
 	MessageTypeUser     = "user"
 	MessageTypeSystem   = "system"
 	BroadcastBufferSize = 100
+	ReadTimeout         = 30 * time.Second
 )
 
 type ChatMessage struct {
@@ -59,13 +62,12 @@ func StartEchoServer(port string, hub *Hub) error {
 			continue
 		}
 
-		client := &Client{
-			ID:       GenerateClientID(),
-			Conn:     conn,
-			JoinTime: time.Now(),
+		client := hub.setupClientConnection(conn)
+		if client == nil {
+			continue
 		}
 
-		go handleClient(hub, client)
+		go handleClientMessages(hub, client)
 	}
 }
 
@@ -93,22 +95,31 @@ func ParseIncomingMessage(raw string, senderID string) ChatMessage {
 	}
 }
 
-func handleClient(hub *Hub, client *Client) {
-	defer func() {
-		hub.unregister <- client
-		fmt.Printf("Client %s disconnected. Total: %d\n", client.ID, hub.GetClientCount())
-		client.Conn.Close()
-	}()
-
+func handleClientMessages(hub *Hub, client *Client) {
 	hub.register <- client
 	fmt.Printf("Client %s connected. Total: %d\n", client.ID, hub.GetClientCount())
+	defer hub.cleanupClient(client)
 
 	scanner := bufio.NewScanner(client.Conn)
 
 	for scanner.Scan() {
+		err := client.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		if err != nil {
+			return
+		}
 		msg := ParseIncomingMessage(scanner.Text(), client.ID)
 		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
 		hub.broadcast <- msg
+	}
+
+	var netErr net.Error
+	err := scanner.Err()
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		fmt.Printf("Client %s disconnected (timeout)\n", client.ID)
+	} else if err != nil {
+		fmt.Printf("Client %s disconnected (error: %v)\n", client.ID, err)
+	} else {
+		fmt.Printf("Client %s disconnected\n", client.ID)
 	}
 }
 
@@ -182,6 +193,51 @@ func (h *Hub) GetClientCount() int {
 	req := CountRequest{Response: make(chan int)}
 	h.countRequests <- req
 	return <-req.Response
+}
+
+func (h *Hub) setupClientConnection(conn net.Conn) *Client {
+	client := &Client{
+		ID:       GenerateClientID(),
+		Conn:     conn,
+		JoinTime: time.Now(),
+	}
+
+	err := conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting deadline: %v\n", err)
+		conn.Close()
+		return nil
+	}
+
+	ip := conn.RemoteAddr().String()
+	fmt.Printf("Client %s connected from %s\n", client.ID, ip)
+
+	_, err = conn.Write([]byte("Welcome to the chat, " + client.ID + "\n"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing welcome message: %v\n", err)
+		conn.Close()
+		return nil
+	}
+	fmt.Printf("Welcome message sent to %s\n", client.ID)
+
+	return client
+}
+
+func (h *Hub) cleanupClient(client *Client) {
+	h.unregister <- client
+
+	msg := ChatMessage{
+		Timestamp:   time.Now(),
+		ClientID:    client.ID,
+		Content:     client.ID + " left the chat",
+		MessageType: MessageTypeSystem,
+	}
+
+	h.broadcast <- msg
+
+	client.Conn.Close()
+
+	fmt.Printf("Cleanup completed for %s\n", client.ID)
 }
 
 func main() {
