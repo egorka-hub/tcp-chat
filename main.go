@@ -28,10 +28,20 @@ type Client struct {
 }
 
 type Hub struct {
-	clients    map[string]*Client
-	broadcast  chan ChatMessage
-	register   chan *Client
-	unregister chan *Client
+	clients         map[string]*Client
+	broadcast       chan ChatMessage
+	register        chan *Client
+	unregister      chan *Client
+	clientsRequests chan ClientsRequest
+	countRequests   chan CountRequest
+}
+
+type ClientsRequest struct {
+	Response chan []string
+}
+
+type CountRequest struct {
+	Response chan int
 }
 
 func StartEchoServer(port string, hub *Hub) error {
@@ -55,7 +65,6 @@ func StartEchoServer(port string, hub *Hub) error {
 			JoinTime: time.Now(),
 		}
 
-		fmt.Printf("Client %s connected, starting goroutine\n", client.ID)
 		go handleClient(hub, client)
 	}
 }
@@ -87,11 +96,12 @@ func ParseIncomingMessage(raw string, senderID string) ChatMessage {
 func handleClient(hub *Hub, client *Client) {
 	defer func() {
 		hub.unregister <- client
+		fmt.Printf("Client %s disconnected. Total: %d\n", client.ID, hub.GetClientCount())
 		client.Conn.Close()
 	}()
 
 	hub.register <- client
-	defer fmt.Printf("Client %s disconnected\n", client.ID)
+	fmt.Printf("Client %s connected. Total: %d\n", client.ID, hub.GetClientCount())
 
 	scanner := bufio.NewScanner(client.Conn)
 
@@ -121,6 +131,16 @@ func (h *Hub) Run() {
 
 		case msg := <-h.broadcast:
 			h.BroadcastMessage(msg)
+
+		case req := <-h.countRequests:
+			req.Response <- len(h.clients)
+
+		case req := <-h.clientsRequests:
+			ids := make([]string, 0, len(h.clients))
+			for id := range h.clients {
+				ids = append(ids, id)
+			}
+			req.Response <- ids
 		}
 	}
 }
@@ -143,11 +163,25 @@ func (h *Hub) BroadcastMessage(msg ChatMessage) {
 
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]*Client),
-		broadcast:  make(chan ChatMessage, BroadcastBufferSize),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		clients:         make(map[string]*Client),
+		broadcast:       make(chan ChatMessage, BroadcastBufferSize),
+		register:        make(chan *Client),
+		unregister:      make(chan *Client),
+		clientsRequests: make(chan ClientsRequest),
+		countRequests:   make(chan CountRequest),
 	}
+}
+
+func (h *Hub) GetActiveClients() []string {
+	req := ClientsRequest{Response: make(chan []string)}
+	h.clientsRequests <- req
+	return <-req.Response
+}
+
+func (h *Hub) GetClientCount() int {
+	req := CountRequest{Response: make(chan int)}
+	h.countRequests <- req
+	return <-req.Response
 }
 
 func main() {
