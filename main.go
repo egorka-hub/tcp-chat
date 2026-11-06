@@ -47,27 +47,14 @@ type CountRequest struct {
 	Response chan int
 }
 
-func StartEchoServer(port string, hub *Hub) error {
-	listener, err := net.Listen("tcp", port)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	fmt.Println("TCP Chat Server listening on", port)
+func ParseIncomingMessage(raw string, senderID string) ChatMessage {
+	timestamp := time.Now()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("accept error:", err)
-			continue
-		}
-
-		client := hub.setupClientConnection(conn)
-		if client == nil {
-			continue
-		}
-
-		go handleClientMessages(hub, client)
+	return ChatMessage{
+		Timestamp:   timestamp,
+		ClientID:    senderID,
+		Content:     raw,
+		MessageType: MessageTypeUser,
 	}
 }
 
@@ -84,50 +71,22 @@ func FormatMessage(msg ChatMessage) string {
 	}
 }
 
-func ParseIncomingMessage(raw string, senderID string) ChatMessage {
-	timestamp := time.Now()
-
-	return ChatMessage{
-		Timestamp:   timestamp,
-		ClientID:    senderID,
-		Content:     raw,
-		MessageType: MessageTypeUser,
-	}
-}
-
-func handleClientMessages(hub *Hub, client *Client) {
-	hub.register <- client
-	fmt.Printf("Client %s connected. Total: %d\n", client.ID, hub.GetClientCount())
-	defer hub.cleanupClient(client)
-
-	scanner := bufio.NewScanner(client.Conn)
-
-	for scanner.Scan() {
-		err := client.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
-		if err != nil {
-			return
-		}
-		msg := ParseIncomingMessage(scanner.Text(), client.ID)
-		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
-		hub.broadcast <- msg
-	}
-
-	var netErr net.Error
-	err := scanner.Err()
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		fmt.Printf("Client %s disconnected (timeout)\n", client.ID)
-	} else if err != nil {
-		fmt.Printf("Client %s disconnected (error: %v)\n", client.ID, err)
-	} else {
-		fmt.Printf("Client %s disconnected\n", client.ID)
-	}
-}
-
 var clientCounter atomic.Int64
 
 func GenerateClientID() string {
 	n := clientCounter.Add(1)
 	return fmt.Sprintf("User_%03d", n)
+}
+
+func NewHub() *Hub {
+	return &Hub{
+		clients:         make(map[string]*Client),
+		broadcast:       make(chan ChatMessage, BroadcastBufferSize),
+		register:        make(chan *Client),
+		unregister:      make(chan *Client),
+		clientsRequests: make(chan ClientsRequest),
+		countRequests:   make(chan CountRequest),
+	}
 }
 
 func (h *Hub) Run() {
@@ -172,17 +131,6 @@ func (h *Hub) BroadcastMessage(msg ChatMessage) {
 
 }
 
-func NewHub() *Hub {
-	return &Hub{
-		clients:         make(map[string]*Client),
-		broadcast:       make(chan ChatMessage, BroadcastBufferSize),
-		register:        make(chan *Client),
-		unregister:      make(chan *Client),
-		clientsRequests: make(chan ClientsRequest),
-		countRequests:   make(chan CountRequest),
-	}
-}
-
 func (h *Hub) GetActiveClients() []string {
 	req := ClientsRequest{Response: make(chan []string)}
 	h.clientsRequests <- req
@@ -223,6 +171,34 @@ func (h *Hub) setupClientConnection(conn net.Conn) *Client {
 	return client
 }
 
+func handleClientMessages(hub *Hub, client *Client) {
+	hub.register <- client
+	fmt.Printf("Client %s connected. Total: %d\n", client.ID, hub.GetClientCount())
+	defer hub.cleanupClient(client)
+
+	scanner := bufio.NewScanner(client.Conn)
+
+	for scanner.Scan() {
+		err := client.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+		if err != nil {
+			return
+		}
+		msg := ParseIncomingMessage(scanner.Text(), client.ID)
+		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
+		hub.broadcast <- msg
+	}
+
+	var netErr net.Error
+	err := scanner.Err()
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		fmt.Printf("Client %s disconnected (timeout)\n", client.ID)
+	} else if err != nil {
+		fmt.Printf("Client %s disconnected (error: %v)\n", client.ID, err)
+	} else {
+		fmt.Printf("Client %s disconnected\n", client.ID)
+	}
+}
+
 func (h *Hub) cleanupClient(client *Client) {
 	h.unregister <- client
 
@@ -240,13 +216,37 @@ func (h *Hub) cleanupClient(client *Client) {
 	fmt.Printf("Cleanup completed for %s\n", client.ID)
 }
 
+func StartServer(port string, hub *Hub) error {
+	listener, err := net.Listen("tcp", port)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	fmt.Println("TCP Chat Server listening on", port)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Println("accept error:", err)
+			continue
+		}
+
+		client := hub.setupClientConnection(conn)
+		if client == nil {
+			continue
+		}
+
+		go handleClientMessages(hub, client)
+	}
+}
+
 func main() {
 	const port = ":8080"
 
 	hub := NewHub()
 	go hub.Run()
 
-	err := StartEchoServer(port, hub)
+	err := StartServer(port, hub)
 	if err != nil {
 		fmt.Println("server error:", err)
 		return
