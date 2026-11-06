@@ -46,12 +46,9 @@ func StartEchoServer(port string) error {
 			Conn:     conn,
 			JoinTime: time.Now(),
 		}
-		fmt.Printf("Client %s connected\n", client.ID)
 
-		if err := HandleClient(client); err != nil {
-			fmt.Printf("Client %s error: %v\n", client.ID, err)
-		}
-		fmt.Printf("Client %s disconnected\n", client.ID)
+		fmt.Printf("Client %s connected, starting goroutine\n", client.ID)
+		go handleClient(client.Conn, client.ID)
 	}
 }
 
@@ -79,21 +76,19 @@ func ParseIncomingMessage(raw string, senderID string) ChatMessage {
 	}
 }
 
-func HandleClient(client *Client) error {
-	defer client.Conn.Close()
+func handleClient(conn net.Conn, clientID string) {
+	defer conn.Close()
 
-	scanner := bufio.NewScanner(client.Conn)
+	scanner := bufio.NewScanner(conn)
 
 	for scanner.Scan() {
-		msg := ParseIncomingMessage(scanner.Text(), client.ID)
-		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
+		msg := ParseIncomingMessage(scanner.Text(), clientID)
+		fmt.Printf("Client %s: %s\n", clientID, msg.Content)
 		formatted := FormatMessage(msg)
-		if _, err := client.Conn.Write([]byte(formatted + "\n")); err != nil {
-			return err
-		}
+		conn.Write([]byte(formatted + "\n"))
 	}
 
-	return scanner.Err()
+	fmt.Printf("Client %s disconnected\n", clientID)
 }
 
 var clientCounter atomic.Int64
