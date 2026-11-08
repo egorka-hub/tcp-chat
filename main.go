@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"sort"
@@ -43,6 +44,11 @@ type Hub struct {
 	clientsRequests chan ClientsRequest
 	countRequests   chan CountRequest
 	history         *MessageHistory
+	logger          *log.Logger
+
+	statsMu   sync.Mutex
+	stats     ServerStats
+	startTime time.Time
 }
 
 type ClientsRequest struct {
@@ -59,6 +65,13 @@ type MessageHistory struct {
 	head     int
 	count    int
 	size     int
+}
+
+type ServerStats struct {
+	ActiveConnections      int
+	TotalMessagesProcessed int64
+	UptimeSeconds          int64
+	ErrorCount             int
 }
 
 func ParseIncomingMessage(raw string, senderID string) ChatMessage {
@@ -92,7 +105,7 @@ func GenerateClientID() string {
 	return fmt.Sprintf("User_%03d", n)
 }
 
-func NewHub() *Hub {
+func NewHub(logger *log.Logger) *Hub {
 	return &Hub{
 		clients:         make(map[string]*Client),
 		broadcast:       make(chan ChatMessage, BroadcastBufferSize),
@@ -101,7 +114,40 @@ func NewHub() *Hub {
 		clientsRequests: make(chan ClientsRequest),
 		countRequests:   make(chan CountRequest),
 		history:         NewMessageHistory(MaxHistorySize),
+		logger:          logger,
+		startTime:       time.Now(),
 	}
+}
+
+func (h *Hub) setActiveConnections(n int) {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.stats.ActiveConnections = n
+}
+
+func (h *Hub) incMessages() {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.stats.TotalMessagesProcessed++
+}
+
+func (h *Hub) incErrors() {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.stats.ErrorCount++
+}
+
+func (h *Hub) GetStats() ServerStats {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	stats := h.stats
+	stats.UptimeSeconds = int64(time.Since(h.startTime).Seconds())
+	return stats
+}
+
+func (h *Hub) logError(format string, args ...any) {
+	h.incErrors()
+	h.logger.Printf("ERROR "+format, args...)
 }
 
 func (h *Hub) Run() {
@@ -109,10 +155,12 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.register:
 			h.clients[client.ID] = client
-			fmt.Printf("Client %s registered\n", client.ID)
+			h.setActiveConnections(len(h.clients))
+			h.logger.Printf("INFO  Client %s registered", client.ID)
 		case client := <-h.unregister:
 			delete(h.clients, client.ID)
-			fmt.Printf("Client %s unregistered\n", client.ID)
+			h.setActiveConnections(len(h.clients))
+			h.logger.Printf("INFO  Client %s unregistered", client.ID)
 
 		case msg := <-h.broadcast:
 			if msg.MessageType == MessageTypeUser {
@@ -142,7 +190,7 @@ func (h *Hub) BroadcastMessage(msg ChatMessage) {
 		}
 		_, err := client.Conn.Write([]byte(text))
 		if err != nil {
-			fmt.Printf("Write error to %s: %v\n", client.ID, err)
+			h.logError("Write error to %s: %v", client.ID, err)
 			continue
 		}
 	}
@@ -170,17 +218,17 @@ func (h *Hub) setupClientConnection(conn net.Conn) *Client {
 
 	err := conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting deadline: %v\n", err)
+		h.logError("Client %s: error setting deadline: %v", client.ID, err)
 		conn.Close()
 		return nil
 	}
 
 	ip := conn.RemoteAddr().String()
-	fmt.Printf("Client %s connected from %s\n", client.ID, ip)
+	h.logger.Printf("INFO  Client %s connected from %s", client.ID, ip)
 
 	err = h.SendHistory(conn)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing history: %v\n", err)
+		h.logError("Client %s: error writing history: %v", client.ID, err)
 		conn.Close()
 		return nil
 	}
@@ -207,15 +255,22 @@ func (h *Hub) SendHistory(conn net.Conn) error {
 
 func handleClientMessages(hub *Hub, client *Client) {
 	hub.register <- client
-	defer hub.cleanupClient(client)
+	defer func() {
+		// recover() вызывается первым: если упадёт сама очистка,
+		// строки после неё уже не выполнятся.
+		if r := recover(); r != nil {
+			hub.logError("Client %s panic recovered: %v", client.ID, r)
+		}
+		hub.cleanupClient(client)
+	}()
 
 	count := hub.GetClientCount()
-	fmt.Printf("Client %s connected. Total: %d\n", client.ID, count)
+	hub.logger.Printf("INFO  Client %s joined. Total: %d", client.ID, count)
 
 	welcome := fmt.Sprintf("Welcome, %s! %d users online. Type /help for commands.\n", client.ID, count)
 	_, err := client.Conn.Write([]byte(welcome))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing welcome message to %s: %v\n", client.ID, err)
+		hub.logError("Client %s: error writing welcome message: %v", client.ID, err)
 		return
 	}
 
@@ -224,25 +279,27 @@ func handleClientMessages(hub *Hub, client *Client) {
 	for scanner.Scan() {
 		err := client.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 		if err != nil {
+			hub.logError("Client %s: error setting deadline: %v", client.ID, err)
 			return
 		}
+		hub.incMessages()
 		if strings.HasPrefix(scanner.Text(), "/") {
 			hub.HandleCommand(client, scanner.Text())
 			continue
 		}
 		msg := ParseIncomingMessage(scanner.Text(), client.ID)
-		fmt.Printf("Client %s: %s\n", client.ID, msg.Content)
+		hub.logger.Printf("INFO  Client %s: %s", client.ID, msg.Content)
 		hub.broadcast <- msg
 	}
 
 	var netErr net.Error
 	err = scanner.Err()
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		fmt.Printf("Client %s disconnected (timeout)\n", client.ID)
+		hub.logger.Printf("WARN  Client %s disconnected (timeout)", client.ID)
 	} else if err != nil {
-		fmt.Printf("Client %s disconnected (error: %v)\n", client.ID, err)
+		hub.logError("Client %s connection error: %v", client.ID, err)
 	} else {
-		fmt.Printf("Client %s disconnected\n", client.ID)
+		hub.logger.Printf("INFO  Client %s disconnected", client.ID)
 	}
 }
 
@@ -260,7 +317,7 @@ func (h *Hub) cleanupClient(client *Client) {
 
 	client.Conn.Close()
 
-	fmt.Printf("Cleanup completed for %s\n", client.ID)
+	h.logger.Printf("WARN  Cleaning up %s, server continues", client.ID)
 }
 
 func StartServer(port string, hub *Hub) error {
@@ -269,12 +326,12 @@ func StartServer(port string, hub *Hub) error {
 		return err
 	}
 	defer listener.Close()
-	fmt.Println("TCP Chat Server listening on", port)
+	hub.logger.Printf("INFO  Server starting on port %s", port)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("accept error:", err)
+			hub.logError("Accept error: %v", err)
 			continue
 		}
 
@@ -300,7 +357,7 @@ func (h *Hub) SendUserList(client *Client) {
 	formatted := FormatMessage(msg) + "\n"
 	_, err := client.Conn.Write([]byte(formatted))
 	if err != nil {
-		fmt.Printf("Write error to %s: %v\n", client.ID, err)
+		h.logError("Write error to %s: %v", client.ID, err)
 	}
 }
 
@@ -342,9 +399,13 @@ func (h *Hub) HandleCommand(client *Client, command string) {
 		h.SendUserList(client)
 		return
 	case "/help":
-		text = "Commands: /users, /help, /time, /quit"
+		text = "Commands: /users, /help, /time, /stats, /quit"
 	case "/time":
 		text = "Server time: " + time.Now().Format("15:04:05")
+	case "/stats":
+		s := h.GetStats()
+		text = fmt.Sprintf("Active: %d, Messages: %d, Uptime: %ds, Errors: %d",
+			s.ActiveConnections, s.TotalMessagesProcessed, s.UptimeSeconds, s.ErrorCount)
 	case "/quit":
 		text = "Goodbye!"
 	default:
@@ -359,7 +420,7 @@ func (h *Hub) HandleCommand(client *Client, command string) {
 	formatted := FormatMessage(msg) + "\n"
 	_, err := client.Conn.Write([]byte(formatted))
 	if err != nil {
-		fmt.Printf("Write error to %s: %v\n", client.ID, err)
+		h.logError("Write error to %s: %v", client.ID, err)
 	}
 
 	if cmd == "/quit" {
@@ -367,13 +428,18 @@ func (h *Hub) HandleCommand(client *Client, command string) {
 	}
 }
 
+func setupLogging(level string) *log.Logger {
+	return log.New(os.Stdout, "[TCP-CHAT] ", log.LstdFlags)
+}
+
 func main() {
-	hub := NewHub()
+	logger := setupLogging("info")
+	hub := NewHub(logger)
 	go hub.Run()
 
 	err := StartServer(ServerPort, hub)
 	if err != nil {
-		fmt.Println("server error:", err)
+		logger.Printf("ERROR Server error: %v", err)
 		return
 	}
 }
