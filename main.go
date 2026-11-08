@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +24,8 @@ const (
 	ReadTimeout         = 30 * time.Second
 	ServerPort          = ":8080"
 	MaxHistorySize      = 50
+	ShutdownTimeout     = 10 * time.Second
+	ForceCloseTimeout   = 2 * time.Second
 )
 
 type ChatMessage struct {
@@ -43,12 +48,18 @@ type Hub struct {
 	unregister      chan *Client
 	clientsRequests chan ClientsRequest
 	countRequests   chan CountRequest
+	closeRequests   chan CloseAllRequest
 	history         *MessageHistory
 	logger          *log.Logger
 
 	statsMu   sync.Mutex
 	stats     ServerStats
 	startTime time.Time
+
+	closeMu sync.RWMutex
+	closed  bool
+
+	wg sync.WaitGroup
 }
 
 type ClientsRequest struct {
@@ -56,6 +67,10 @@ type ClientsRequest struct {
 }
 
 type CountRequest struct {
+	Response chan int
+}
+
+type CloseAllRequest struct {
 	Response chan int
 }
 
@@ -113,6 +128,7 @@ func NewHub(logger *log.Logger) *Hub {
 		unregister:      make(chan *Client),
 		clientsRequests: make(chan ClientsRequest),
 		countRequests:   make(chan CountRequest),
+		closeRequests:   make(chan CloseAllRequest),
 		history:         NewMessageHistory(MaxHistorySize),
 		logger:          logger,
 		startTime:       time.Now(),
@@ -150,7 +166,24 @@ func (h *Hub) logError(format string, args ...any) {
 	h.logger.Printf("ERROR "+format, args...)
 }
 
+func (h *Hub) send(msg ChatMessage) bool {
+	h.closeMu.RLock()
+	defer h.closeMu.RUnlock()
+	if h.closed {
+		return false
+	}
+	h.broadcast <- msg
+	return true
+}
+
+func (h *Hub) closeAllConnections() int {
+	req := CloseAllRequest{Response: make(chan int)}
+	h.closeRequests <- req
+	return <-req.Response
+}
+
 func (h *Hub) Run() {
+	broadcast := h.broadcast
 	for {
 		select {
 		case client := <-h.register:
@@ -162,7 +195,11 @@ func (h *Hub) Run() {
 			h.setActiveConnections(len(h.clients))
 			h.logger.Printf("INFO  Client %s unregistered", client.ID)
 
-		case msg := <-h.broadcast:
+		case msg, ok := <-broadcast:
+			if !ok {
+				broadcast = nil
+				continue
+			}
 			if msg.MessageType == MessageTypeUser {
 				h.history.Add(msg)
 			}
@@ -177,6 +214,12 @@ func (h *Hub) Run() {
 				ids = append(ids, id)
 			}
 			req.Response <- ids
+
+		case req := <-h.closeRequests:
+			for _, client := range h.clients {
+				client.Conn.Close()
+			}
+			req.Response <- len(h.clients)
 		}
 	}
 }
@@ -254,10 +297,10 @@ func (h *Hub) SendHistory(conn net.Conn) error {
 }
 
 func handleClientMessages(hub *Hub, client *Client) {
+	defer hub.wg.Done()
+
 	hub.register <- client
 	defer func() {
-		// recover() вызывается первым: если упадёт сама очистка,
-		// строки после неё уже не выполнятся.
 		if r := recover(); r != nil {
 			hub.logError("Client %s panic recovered: %v", client.ID, r)
 		}
@@ -289,13 +332,15 @@ func handleClientMessages(hub *Hub, client *Client) {
 		}
 		msg := ParseIncomingMessage(scanner.Text(), client.ID)
 		hub.logger.Printf("INFO  Client %s: %s", client.ID, msg.Content)
-		hub.broadcast <- msg
+		hub.send(msg)
 	}
 
 	var netErr net.Error
 	err = scanner.Err()
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		hub.logger.Printf("WARN  Client %s disconnected (timeout)", client.ID)
+	} else if errors.Is(err, net.ErrClosed) {
+		hub.logger.Printf("INFO  Client %s disconnected (connection closed)", client.ID)
 	} else if err != nil {
 		hub.logError("Client %s connection error: %v", client.ID, err)
 	} else {
@@ -313,14 +358,14 @@ func (h *Hub) cleanupClient(client *Client) {
 		MessageType: MessageTypeSystem,
 	}
 
-	h.broadcast <- msg
+	h.send(msg)
 
 	client.Conn.Close()
 
 	h.logger.Printf("WARN  Cleaning up %s, server continues", client.ID)
 }
 
-func StartServer(port string, hub *Hub) error {
+func StartServer(ctx context.Context, port string, hub *Hub) error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		return err
@@ -328,9 +373,17 @@ func StartServer(port string, hub *Hub) error {
 	defer listener.Close()
 	hub.logger.Printf("INFO  Server starting on port %s", port)
 
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			hub.logError("Accept error: %v", err)
 			continue
 		}
@@ -340,7 +393,58 @@ func StartServer(port string, hub *Hub) error {
 			continue
 		}
 
+		hub.wg.Add(1)
 		go handleClientMessages(hub, client)
+	}
+}
+
+func setupSignalHandling() chan os.Signal {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	return sigCh
+}
+
+func (h *Hub) Shutdown(ctx context.Context) error {
+	count := h.GetClientCount()
+	h.logger.Printf("INFO  Notifying %d clients...", count)
+
+	grace := ShutdownTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		grace = time.Until(deadline).Round(time.Second)
+	}
+	h.send(ChatMessage{
+		Timestamp:   time.Now(),
+		Content:     fmt.Sprintf("Server shutting down in %d seconds", int(grace.Seconds())),
+		MessageType: MessageTypeSystem,
+	})
+
+	h.closeMu.Lock()
+	h.closed = true
+	close(h.broadcast)
+	h.closeMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		h.logger.Printf("INFO  All clients disconnected")
+		return nil
+	case <-ctx.Done():
+	}
+
+	h.logger.Printf("WARN  Grace period over, closing %d remaining connections", h.GetClientCount())
+	h.closeAllConnections()
+
+	select {
+	case <-done:
+		h.logger.Printf("INFO  All clients disconnected")
+		return nil
+	case <-time.After(ForceCloseTimeout):
+		return errors.New("client goroutines did not finish after closing connections")
 	}
 }
 
@@ -437,9 +541,37 @@ func main() {
 	hub := NewHub(logger)
 	go hub.Run()
 
-	err := StartServer(ServerPort, hub)
-	if err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := setupSignalHandling()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- StartServer(ctx, ServerPort, hub)
+	}()
+
+	select {
+	case sig := <-sigCh:
+		logger.Printf("INFO  Shutdown signal received (%v)", sig)
+	case err := <-serverErr:
 		logger.Printf("ERROR Server error: %v", err)
 		return
 	}
+
+	signal.Stop(sigCh)
+
+	cancel()
+	if err := <-serverErr; err != nil {
+		logger.Printf("ERROR Server error: %v", err)
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), ShutdownTimeout)
+	defer cancelShutdown()
+
+	if err := hub.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("ERROR Shutdown failed: %v", err)
+		return
+	}
+	logger.Printf("INFO  Server stopped gracefully")
 }
