@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -28,8 +31,11 @@ const (
 	ShutdownTimeout     = 10 * time.Second
 	ForceCloseTimeout   = 2 * time.Second
 	RejectWriteTimeout  = time.Second
+	MonitorStopTimeout  = 2 * time.Second
+	MonitorReadTimeout  = 5 * time.Second
 
 	DefaultPort           = "8080"
+	DefaultMonitorPort    = "8081"
 	DefaultMaxConnections = 500
 	DefaultLogLevel       = "info"
 	DefaultHistorySize    = 50
@@ -39,6 +45,7 @@ var validLogLevels = []string{"debug", "info", "warn", "error"}
 
 type ServerConfig struct {
 	Port               string
+	MonitorPort        string
 	MaxConnections     int
 	LogLevel           string
 	MessageHistorySize int
@@ -77,6 +84,8 @@ type Hub struct {
 
 	wg    sync.WaitGroup
 	slots chan struct{}
+
+	monitor *http.Server
 }
 
 type ClientsRequest struct {
@@ -100,10 +109,21 @@ type MessageHistory struct {
 }
 
 type ServerStats struct {
-	ActiveConnections      int
-	TotalMessagesProcessed int64
-	UptimeSeconds          int64
-	ErrorCount             int
+	ActiveConnections      int   `json:"active_connections"`
+	TotalMessagesProcessed int64 `json:"total_messages_processed"`
+	UptimeSeconds          int64 `json:"uptime_seconds"`
+	ErrorCount             int   `json:"error_count"`
+}
+
+type HealthResponse struct {
+	Status            string `json:"status"`
+	ActiveConnections int    `json:"active_connections"`
+	UptimeSeconds     int64  `json:"uptime_seconds"`
+}
+
+type StatsResponse struct {
+	ServerStats
+	MessageRate float64 `json:"message_rate"`
 }
 
 func ParseIncomingMessage(raw string, senderID string) ChatMessage {
@@ -578,12 +598,97 @@ func (h *Hub) HandleCommand(client *Client, command string) {
 	}
 }
 
+func (h *Hub) isShuttingDown() bool {
+	h.closeMu.RLock()
+	defer h.closeMu.RUnlock()
+	return h.closed
+}
+
+func startHTTPMonitoring(hub *Hub, port string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealthEndpoint(hub))
+	mux.HandleFunc("GET /stats", handleStatsEndpoint(hub))
+
+	addr := ":" + strings.TrimPrefix(port, ":")
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		hub.logError("Monitoring server failed to start on %s: %v", addr, err)
+		return
+	}
+
+	hub.monitor = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: MonitorReadTimeout,
+	}
+	hub.logger.Printf("INFO  Monitoring server listening on %s", addr)
+
+	go func() {
+		err := hub.monitor.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			hub.logError("Monitoring server error: %v", err)
+		}
+	}()
+}
+
+func (h *Hub) stopHTTPMonitoring() {
+	if h.monitor == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), MonitorStopTimeout)
+	defer cancel()
+	if err := h.monitor.Shutdown(ctx); err != nil {
+		h.logError("Monitoring server shutdown error: %v", err)
+		return
+	}
+	h.logger.Printf("INFO  Monitoring server stopped")
+}
+
+func handleHealthEndpoint(hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		stats := hub.GetStats()
+		status := "healthy"
+		if hub.isShuttingDown() {
+			status = "shutting_down"
+		}
+		hub.writeJSON(w, HealthResponse{
+			Status:            status,
+			ActiveConnections: stats.ActiveConnections,
+			UptimeSeconds:     stats.UptimeSeconds,
+		}, false)
+	}
+}
+
+func handleStatsEndpoint(hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		stats := hub.GetStats()
+		uptime := math.Max(time.Since(hub.startTime).Seconds(), 1)
+		rate := float64(stats.TotalMessagesProcessed) / uptime
+		hub.writeJSON(w, StatsResponse{
+			ServerStats: stats,
+			MessageRate: math.Round(rate*100) / 100,
+		}, true)
+	}
+}
+
+func (h *Hub) writeJSON(w http.ResponseWriter, v any, indent bool) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	if indent {
+		enc.SetIndent("", "  ")
+	}
+	if err := enc.Encode(v); err != nil {
+		h.logError("Monitoring response write error: %v", err)
+	}
+}
+
 func setupLogging(level string) *log.Logger {
 	return log.New(os.Stdout, "[TCP-CHAT] ", log.LstdFlags)
 }
 
 func parseCommandLineArgs() ServerConfig {
 	port := flag.String("port", DefaultPort, "Server port")
+	monitorPort := flag.String("monitor-port", DefaultMonitorPort, "HTTP monitoring port")
 	maxConnections := flag.Int("max-connections", DefaultMaxConnections, "Maximum connections")
 	logLevel := flag.String("log-level", DefaultLogLevel, "Log level: "+strings.Join(validLogLevels, ", "))
 	historySize := flag.Int("history-size", DefaultHistorySize, "Number of messages kept in history")
@@ -593,6 +698,7 @@ func parseCommandLineArgs() ServerConfig {
 
 	return ServerConfig{
 		Port:               strings.TrimPrefix(*port, ":"),
+		MonitorPort:        strings.TrimPrefix(*monitorPort, ":"),
 		MaxConnections:     *maxConnections,
 		LogLevel:           strings.ToLower(*logLevel),
 		MessageHistorySize: *historySize,
@@ -604,7 +710,7 @@ func printUsage() {
 	fmt.Fprintln(out, "Usage:")
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	for _, name := range []string{"port", "max-connections", "log-level", "history-size"} {
+	for _, name := range []string{"port", "monitor-port", "max-connections", "log-level", "history-size"} {
 		f := flag.Lookup(name)
 		typeName, usage := flag.UnquoteUsage(f)
 		def := f.DefValue
@@ -616,10 +722,23 @@ func printUsage() {
 	w.Flush()
 }
 
-func validateConfig(config ServerConfig) error {
-	port, err := strconv.Atoi(config.Port)
+func validatePort(name, value string) error {
+	port, err := strconv.Atoi(value)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid port %q: must be a number from 1 to 65535", config.Port)
+		return fmt.Errorf("invalid %s %q: must be a number from 1 to 65535", name, value)
+	}
+	return nil
+}
+
+func validateConfig(config ServerConfig) error {
+	if err := validatePort("port", config.Port); err != nil {
+		return err
+	}
+	if err := validatePort("monitor-port", config.MonitorPort); err != nil {
+		return err
+	}
+	if config.Port == config.MonitorPort {
+		return fmt.Errorf("port and monitor-port must differ, both are %s", config.Port)
 	}
 	if config.MaxConnections < 1 {
 		return fmt.Errorf("invalid max-connections %d: must be at least 1", config.MaxConnections)
@@ -640,12 +759,15 @@ func printStartupBanner(config ServerConfig) {
 	fmt.Println("║           TCP Chat Server            ║")
 	fmt.Println("╚══════════════════════════════════════╝")
 	fmt.Printf("Port:            %s\n", config.Port)
+	fmt.Printf("Monitor Port:    %s\n", config.MonitorPort)
 	fmt.Printf("Max Connections: %d\n", config.MaxConnections)
 	fmt.Printf("Log Level:       %s\n", strings.ToUpper(config.LogLevel))
 	fmt.Printf("History Size:    %d\n", config.MessageHistorySize)
 	fmt.Println()
 	fmt.Printf("Connect using: telnet localhost %s\n", config.Port)
 	fmt.Printf("           or: nc localhost %s\n", config.Port)
+	fmt.Printf("Health check:  curl http://localhost:%s/health\n", config.MonitorPort)
+	fmt.Printf("Statistics:    curl http://localhost:%s/stats\n", config.MonitorPort)
 	fmt.Println("Press Ctrl+C to stop the server")
 	fmt.Println()
 }
@@ -663,6 +785,8 @@ func main() {
 
 	hub := NewHub(logger, config)
 	go hub.Run()
+
+	startHTTPMonitoring(hub, config.MonitorPort)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -692,8 +816,10 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), ShutdownTimeout)
 	defer cancelShutdown()
 
-	if err := hub.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("ERROR Shutdown failed: %v", err)
+	shutdownErr := hub.Shutdown(shutdownCtx)
+	hub.stopHTTPMonitoring()
+	if shutdownErr != nil {
+		logger.Printf("ERROR Shutdown failed: %v", shutdownErr)
 		return
 	}
 	logger.Printf("INFO  Server stopped gracefully")
