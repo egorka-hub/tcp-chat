@@ -3,7 +3,7 @@ package hub
 import (
 	"sync"
 
-	"tcp-chat/internal/domain"
+	"github.com/egorka-hub/tcp-chat/internal/domain"
 )
 
 type MessageHistory struct {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	"tcp-chat/internal/hub"
+	"github.com/egorka-hub/tcp-chat/internal/hub"
 )
 
 func StartTCPServer(ctx context.Context, addr string, h *hub.Hub) error {

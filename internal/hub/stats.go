@@ -3,7 +3,7 @@ package hub
 import (
 	"time"
 
-	"tcp-chat/internal/domain"
+	"github.com/egorka-hub/tcp-chat/internal/domain"
 )
 
 func (h *Hub) setActiveConnections(n int) {

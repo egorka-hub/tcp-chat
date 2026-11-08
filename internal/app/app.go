@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"tcp-chat/internal/config"
-	"tcp-chat/internal/hub"
-	"tcp-chat/internal/server"
+	"github.com/egorka-hub/tcp-chat/internal/config"
+	"github.com/egorka-hub/tcp-chat/internal/hub"
+	"github.com/egorka-hub/tcp-chat/internal/server"
 )
 
 const ShutdownTimeout = 10 * time.Second

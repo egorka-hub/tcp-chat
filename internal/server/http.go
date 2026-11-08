@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"tcp-chat/internal/domain"
-	"tcp-chat/internal/hub"
+	"github.com/egorka-hub/tcp-chat/internal/domain"
+	"github.com/egorka-hub/tcp-chat/internal/hub"
 )
 
 const (

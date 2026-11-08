@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"tcp-chat/internal/domain"
+	"github.com/egorka-hub/tcp-chat/internal/domain"
 )
 
 const (

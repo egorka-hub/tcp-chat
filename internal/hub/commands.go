@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"tcp-chat/internal/domain"
+	"github.com/egorka-hub/tcp-chat/internal/domain"
 )
 
 func (h *Hub) HandleCommand(client *domain.Client, command string) {

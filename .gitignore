@@ -1,34 +1,41 @@
+# Бинарные файлы
+tcp-chat-server
+/tcp-chat
+/server
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-/tcp-chat
 /bin/
 /build/
 /dist/
 
+# Временные файлы
+*.tmp
+*.log
+/logs/
+
+# Тесты и профилирование
 *.test
 *.out
 coverage.*
 *.coverprofile
 *.prof
 
+# Go
 go.work
 go.work.sum
-
 /vendor/
 
+# Переменные окружения
 .env
 .env.*
 
-*.log
-
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-
 .DS_Store
-/server

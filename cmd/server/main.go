@@ -1,6 +1,6 @@
 package main
 
-import "tcp-chat/internal/app"
+import "github.com/egorka-hub/tcp-chat/internal/app"
 
 func main() {
 	app.Run()
