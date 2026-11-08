@@ -4,16 +4,19 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 )
 
@@ -22,11 +25,24 @@ const (
 	MessageTypeSystem   = "system"
 	BroadcastBufferSize = 100
 	ReadTimeout         = 30 * time.Second
-	ServerPort          = ":8080"
-	MaxHistorySize      = 50
 	ShutdownTimeout     = 10 * time.Second
 	ForceCloseTimeout   = 2 * time.Second
+	RejectWriteTimeout  = time.Second
+
+	DefaultPort           = "8080"
+	DefaultMaxConnections = 500
+	DefaultLogLevel       = "info"
+	DefaultHistorySize    = 50
 )
+
+var validLogLevels = []string{"debug", "info", "warn", "error"}
+
+type ServerConfig struct {
+	Port               string
+	MaxConnections     int
+	LogLevel           string
+	MessageHistorySize int
+}
 
 type ChatMessage struct {
 	Timestamp   time.Time
@@ -59,7 +75,8 @@ type Hub struct {
 	closeMu sync.RWMutex
 	closed  bool
 
-	wg sync.WaitGroup
+	wg    sync.WaitGroup
+	slots chan struct{}
 }
 
 type ClientsRequest struct {
@@ -120,7 +137,7 @@ func GenerateClientID() string {
 	return fmt.Sprintf("User_%03d", n)
 }
 
-func NewHub(logger *log.Logger) *Hub {
+func NewHub(logger *log.Logger, config ServerConfig) *Hub {
 	return &Hub{
 		clients:         make(map[string]*Client),
 		broadcast:       make(chan ChatMessage, BroadcastBufferSize),
@@ -129,10 +146,32 @@ func NewHub(logger *log.Logger) *Hub {
 		clientsRequests: make(chan ClientsRequest),
 		countRequests:   make(chan CountRequest),
 		closeRequests:   make(chan CloseAllRequest),
-		history:         NewMessageHistory(MaxHistorySize),
+		history:         NewMessageHistory(config.MessageHistorySize),
 		logger:          logger,
 		startTime:       time.Now(),
+		slots:           make(chan struct{}, config.MaxConnections),
 	}
+}
+
+func (h *Hub) acquireSlot() bool {
+	select {
+	case h.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Hub) releaseSlot() {
+	<-h.slots
+}
+
+func (h *Hub) rejectConnection(conn net.Conn) {
+	defer conn.Close()
+	h.logger.Printf("WARN  Connection from %s rejected: server is full (%d/%d)",
+		conn.RemoteAddr(), len(h.slots), cap(h.slots))
+	conn.SetWriteDeadline(time.Now().Add(RejectWriteTimeout))
+	conn.Write([]byte("Server is full, try again later.\n"))
 }
 
 func (h *Hub) setActiveConnections(n int) {
@@ -298,6 +337,7 @@ func (h *Hub) SendHistory(conn net.Conn) error {
 
 func handleClientMessages(hub *Hub, client *Client) {
 	defer hub.wg.Done()
+	defer hub.releaseSlot()
 
 	hub.register <- client
 	defer func() {
@@ -388,8 +428,14 @@ func StartServer(ctx context.Context, port string, hub *Hub) error {
 			continue
 		}
 
+		if !hub.acquireSlot() {
+			hub.rejectConnection(conn)
+			continue
+		}
+
 		client := hub.setupClientConnection(conn)
 		if client == nil {
+			hub.releaseSlot()
 			continue
 		}
 
@@ -536,9 +582,86 @@ func setupLogging(level string) *log.Logger {
 	return log.New(os.Stdout, "[TCP-CHAT] ", log.LstdFlags)
 }
 
+func parseCommandLineArgs() ServerConfig {
+	port := flag.String("port", DefaultPort, "Server port")
+	maxConnections := flag.Int("max-connections", DefaultMaxConnections, "Maximum connections")
+	logLevel := flag.String("log-level", DefaultLogLevel, "Log level: "+strings.Join(validLogLevels, ", "))
+	historySize := flag.Int("history-size", DefaultHistorySize, "Number of messages kept in history")
+
+	flag.Usage = printUsage
+	flag.Parse()
+
+	return ServerConfig{
+		Port:               strings.TrimPrefix(*port, ":"),
+		MaxConnections:     *maxConnections,
+		LogLevel:           strings.ToLower(*logLevel),
+		MessageHistorySize: *historySize,
+	}
+}
+
+func printUsage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintln(out, "Usage:")
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	for _, name := range []string{"port", "max-connections", "log-level", "history-size"} {
+		f := flag.Lookup(name)
+		typeName, usage := flag.UnquoteUsage(f)
+		def := f.DefValue
+		if typeName == "string" {
+			def = strconv.Quote(def)
+		}
+		fmt.Fprintf(w, "  --%s %s\t%s (default %s)\n", f.Name, typeName, usage, def)
+	}
+	w.Flush()
+}
+
+func validateConfig(config ServerConfig) error {
+	port, err := strconv.Atoi(config.Port)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port %q: must be a number from 1 to 65535", config.Port)
+	}
+	if config.MaxConnections < 1 {
+		return fmt.Errorf("invalid max-connections %d: must be at least 1", config.MaxConnections)
+	}
+	if config.MessageHistorySize < 1 {
+		return fmt.Errorf("invalid history-size %d: must be at least 1", config.MessageHistorySize)
+	}
+	for _, level := range validLogLevels {
+		if config.LogLevel == level {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid log-level %q: must be one of %s", config.LogLevel, strings.Join(validLogLevels, ", "))
+}
+
+func printStartupBanner(config ServerConfig) {
+	fmt.Println("╔══════════════════════════════════════╗")
+	fmt.Println("║           TCP Chat Server            ║")
+	fmt.Println("╚══════════════════════════════════════╝")
+	fmt.Printf("Port:            %s\n", config.Port)
+	fmt.Printf("Max Connections: %d\n", config.MaxConnections)
+	fmt.Printf("Log Level:       %s\n", strings.ToUpper(config.LogLevel))
+	fmt.Printf("History Size:    %d\n", config.MessageHistorySize)
+	fmt.Println()
+	fmt.Printf("Connect using: telnet localhost %s\n", config.Port)
+	fmt.Printf("           or: nc localhost %s\n", config.Port)
+	fmt.Println("Press Ctrl+C to stop the server")
+	fmt.Println()
+}
+
 func main() {
-	logger := setupLogging("info")
-	hub := NewHub(logger)
+	config := parseCommandLineArgs()
+	if err := validateConfig(config); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	logger := setupLogging(config.LogLevel)
+	printStartupBanner(config)
+
+	hub := NewHub(logger, config)
 	go hub.Run()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -548,7 +671,7 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		serverErr <- StartServer(ctx, ServerPort, hub)
+		serverErr <- StartServer(ctx, ":"+config.Port, hub)
 	}()
 
 	select {
